@@ -1,5 +1,6 @@
 CC := gcc
-CFLAGS := -Wall -Werror -Wextra -pedantic -std=c99 -O3 -march=native -ffast-math
+CFLAGS := -Wall -Werror -Wextra -pedantic -std=c99 -O3 -march=native
+CPPFLAGS := -D_POSIX_C_SOURCE=200809L
 CLIBS := -lm
 OMP := -fopenmp
 
@@ -13,11 +14,16 @@ all: $(TARGET)
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) $(OMP) -o $@ $^ $(CLIBS)
 
-%.o: %.c
-	$(CC) $(CFLAGS) $(OMP) -c -o $@ $<
+%.o: %.c include/utils.h include/constants.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(OMP) -c -o $@ $<
 
 format:
 	clang-format -style=Microsoft -i src/*.c include/*.h
 
 clean:
 	rm -f $(TARGET) $(OBJ)
+
+.PHONY: all clean format test
+
+test: $(TARGET)
+	python3 tests/test_simulation.py ./$(TARGET)
