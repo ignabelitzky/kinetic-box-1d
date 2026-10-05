@@ -1,16 +1,16 @@
 #include "../include/utils.h"
 #include <omp.h>
+#include <errno.h>
 
 /* Compilar usando el Makefile */
 
-int main()
+int main(void)
 {
     int N_THREADS = 0, N_PART = 0, BINS = 0, steps[50], retake = 0, dump = 0;
     unsigned int Ntandas = 0u;
     char inputFilename[255], saveFilename[255];
     double DT = 0.0, M = 0.0, sigmaL = 0.0;
 
-    double xi1 = 0.0, xi2 = 0.0;
     int X0 = 1;
     char filename[32];
 
@@ -24,13 +24,32 @@ int main()
     load_parameters_from_file(data_filename, &N_PART, &BINS, &DT, &M, &N_THREADS, &Ntandas, steps, inputFilename,
                               saveFilename, &retake, &dump, &sigmaL);
 
+    omp_set_dynamic(0);
+    omp_set_num_threads(N_THREADS);
+
+    uint32_t base_seed = (uint32_t)time(NULL);
+    const char *seed_text = getenv("KINETICBOX_SEED");
+    if (seed_text != NULL)
+    {
+        char *end;
+        errno = 0;
+        unsigned long parsed = strtoul(seed_text, &end, 10);
+        if (errno != 0 || seed_text == end || *end != '\0' || (seed_text[0] < '0' || seed_text[0] > '9') || parsed > UINT32_MAX)
+        {
+            fprintf(stderr, "Error: KINETICBOX_SEED must be an unsigned 32-bit integer\n");
+            return EXIT_FAILURE;
+        }
+        base_seed = (uint32_t)parsed;
+    }
+    printf("Random seed = %u; requested threads = %d\n", (unsigned int)base_seed, N_THREADS);
+
     double *x = malloc(sizeof(double) * N_PART);
     double *p = malloc(sizeof(double) * N_PART);
     double *DxE = malloc(sizeof(double) * (2 * BINS + 5));
     double *DpE = malloc(sizeof(double) * (2 * BINS + 1));
     int *h = malloc(sizeof(int) * (2 * BINS + 5));
     int *g = malloc(sizeof(int) * (2 * BINS + 1));
-    int *hg = malloc(sizeof(int) * (2 * BINS + 5) * (2 * BINS + 1));
+    int *hg = malloc(sizeof(int) * (size_t)(2 * BINS + 5) * (size_t)(2 * BINS + 1));
 
     bool memory_allocations = check_memory_allocations(x, p, DxE, DpE, h, g, hg);
     if (!memory_allocations)
@@ -38,10 +57,33 @@ int main()
         return 1;
     }
 
-#pragma omp parallel for reduction(+ : DpE[ : 2 * BINS + 1]) schedule(static)
+    uint32_t *seeds = malloc(sizeof(*seeds) * (size_t)N_THREADS);
+    if (seeds == NULL)
+    {
+        fprintf(stderr, "Error: cannot allocate random states\n");
+        free(x);
+        free(p);
+        free(DxE);
+        free(DpE);
+        free(h);
+        free(g);
+        free(hg);
+        return EXIT_FAILURE;
+    }
+    for (int i = 0; i < N_THREADS; i++)
+    {
+        uint32_t seed = base_seed + UINT32_C(0x9e3779b9) * ((uint32_t)i + 1u);
+        seed = (seed ^ (seed >> 16)) * UINT32_C(0x85ebca6b);
+        seed = (seed ^ (seed >> 13)) * UINT32_C(0xc2b2ae35);
+        seeds[i] = (seed ^ (seed >> 16));
+        if (seeds[i] == 0)
+            seeds[i] = UINT32_C(2463534242);
+    }
+
+#pragma omp parallel for schedule(static)
     for (int i = 0; i <= BINS << 1; i++)
     {
-        double numerator = 6.0E-26 * N_PART;
+        double numerator = (3.0e-23 / BINS) * N_PART;
         double denominator = 5.24684E-24 * sqrt(2.0 * PI);
         double exponent = -pow(3.0e-23 * (1.0 * i / BINS - 1) / 5.24684E-24, 2) / 2;
         DpE[i] = (numerator / denominator) * exp(exponent);
@@ -50,7 +92,7 @@ int main()
 #pragma omp parallel for simd schedule(static)
     for (int i = 0; i <= (BINS + 2) << 1; i++)
     {
-        DxE[i] = 1.0E-3 * N_PART;
+        DxE[i] = N_PART / (2.0 * BINS);
     }
 
     DxE[0] = 0.0;
@@ -62,7 +104,7 @@ int main()
 
     memset(h, 0, (2 * BINS + 5) * sizeof(int));
     memset(g, 0, (2 * BINS + 1) * sizeof(int));
-    memset(hg, 0, (2 * BINS + 5) * (2 * BINS + 1) * sizeof(int));
+    memset(hg, 0, (size_t)(2 * BINS + 5) * (size_t)(2 * BINS + 1) * sizeof(int));
 
     if (retake != 0)
     {
@@ -71,7 +113,7 @@ int main()
 // initialize particles
 #pragma omp parallel
             {
-                uint32_t seed = (uint32_t)(time(NULL) + omp_get_thread_num());
+                uint32_t seed = seeds[omp_get_thread_num()];
 #pragma omp for schedule(static)
                 for (int i = 0; i < N_PART; i++)
                 {
@@ -79,35 +121,22 @@ int main()
                     x[i] = randomValue * 0.5;
                 }
 #pragma omp for schedule(static)
-                for (int i = 0; i < N_PART >> 1; i++)
+                for (int i = 0; i < N_PART / 2 + N_PART % 2; i++)
                 {
                     double randomValue1 = d_xorshift(&seed);
                     double randomValue2 = d_xorshift(&seed);
 
-                    xi1 = sqrt(-2.0 * log(randomValue1 + 1E-35));
-                    xi2 = 2.0 * PI * randomValue2;
+                    double xi1 = sqrt(-2.0 * log(randomValue1));
+                    double xi2 = 2.0 * PI * randomValue2;
 
                     p[2 * i] = xi1 * cos(xi2) * 5.24684E-24;
-                    p[2 * i + 1] = xi1 * sin(xi2) * 5.24684E-24;
+                    if (2 * i + 1 < N_PART)
+                        p[2 * i + 1] = xi1 * sin(xi2) * 5.24684E-24;
                 }
+                seeds[omp_get_thread_num()] = seed;
             }
 
-#pragma omp parallel for schedule(static)
-            for (int i = 0; i < N_PART; i++)
-            {
-                int h_idx = floor((2.0 * x[i] + 1) * BINS + 2.5);
-                int g_idx = floor((p[i] / 3.0e-23 + 1) * BINS + 0.5);
-                int hg_idx = (2 * BINS + 1) * h_idx + g_idx;
-
-                if ((hg_idx > (2 * BINS) * (2 * BINS + 4)) || (hg_idx < 0))
-                {
-                    printf("Error en el índice: hg_idx=%d\n", hg_idx);
-                }
-
-                h[h_idx]++;
-                g[g_idx]++;
-                hg[hg_idx]++;
-            }
+            fill_hist(h, g, hg, x, p, N_PART, BINS);
 
             X0 = make_hist(h, g, hg, DxE, DpE, "X0000000.dat", BINS);
             if (X0 == 1)
@@ -119,6 +148,21 @@ int main()
     else
     {
         read_data(inputFilename, x, p, &evolution, N_PART);
+        fill_hist(h, g, hg, x, p, N_PART, BINS);
+        memset(h, 0, (2 * BINS + 5) * sizeof(int));
+        memset(g, 0, (2 * BINS + 1) * sizeof(int));
+        memset(hg, 0, (size_t)(2 * BINS + 5) * (size_t)(2 * BINS + 1) * sizeof(int));
+    }
+
+    int final_evolution = evolution;
+    for (unsigned int j = 0; j < Ntandas; j++)
+    {
+        if (steps[j] > INT_MAX - final_evolution)
+        {
+            fprintf(stderr, "Error: step count exceeds the legacy checkpoint limit INT_MAX\n");
+            exit(EXIT_FAILURE);
+        }
+        final_evolution += steps[j];
     }
 
     energy_sum(p, N_PART, evolution, M);
@@ -126,28 +170,39 @@ int main()
 
     for (unsigned int j = 0; j < Ntandas; j++)
     {
-        long int k;
-        int signop;
-#pragma omp parallel shared(x, p)
+        int invalid = 0;
+#pragma omp parallel shared(x, p) reduction(| : invalid)
         {
-            uint32_t seed = (uint32_t)(time(NULL) + omp_get_thread_num());
-#pragma omp for private(k, signop) schedule(dynamic)
+            uint32_t seed = seeds[omp_get_thread_num()];
+#pragma omp for schedule(static)
             for (int i = 0; i < N_PART; ++i)
             {
                 double x_tmp = x[i];
                 double p_tmp = p[i];
+                int particle_invalid = 0;
                 for (int step = 0; step < steps[j]; step++)
                 {
                     x_tmp += p_tmp * DT / M;    // ¡OJO que p_tmp tiene un SIGNO!
-                    signop = copysign(1.0, p_tmp);
-                    k = trunc(x_tmp + 0.5 * signop);
+                    int signop = (int)copysign(1.0, p_tmp);
+                    double crossings = trunc(x_tmp + 0.5 * signop);
+                    if (!isfinite(crossings) || fabs(crossings) >= (double)LONG_MAX)
+                    {
+                        particle_invalid = 1;
+                        break;
+                    }
+                    long int k = (long int)crossings;
                     if (k != 0)
                     {
                         double randomValue = d_xorshift(&seed);
-                        double xi1 = sqrt(-2.0 * log(randomValue + 1E-35));
+                        double xi1 = sqrt(-2.0 * log(randomValue));
                         randomValue = d_xorshift(&seed);
                         double xi2 = 2.0 * PI * randomValue;
-                        double deltaX = sqrt(labs(k)) * xi1 * cos(xi2) * sigmaL;
+                        double deltaX = sqrt((double)labs(k)) * xi1 * cos(xi2) * sigmaL;
+                        if (!isfinite(deltaX))
+                        {
+                            particle_invalid = 1;
+                            break;
+                        }
                         deltaX = (fabs(deltaX) > 1.0 ? 1.0 * copysign(1.0, deltaX) : deltaX);
                         x_tmp = (k % 2 ? -1.0 : 1.0) * (x_tmp - k) + deltaX;
                         if (fabs(x_tmp) > 0.502)
@@ -155,42 +210,38 @@ int main()
                             x_tmp = 1.004 * copysign(1.0, x_tmp) - x_tmp;
                         }
                         p_tmp = fabs(p_tmp);    // <-- le saco el signo a p_tmp
-                        for (int l = 1; l <= labs(k); l++)
+                        for (long int l = 0; l < labs(k); l++)
                         {
                             double DeltaE = alfa * pow((p_tmp - pmin) * (pmax - p_tmp), 2);
                             randomValue = d_xorshift(&seed);
-                            p_tmp = sqrt(p_tmp * p_tmp + DeltaE * (randomValue - 0.5));
+                            double p2 = p_tmp * p_tmp + DeltaE * (randomValue - 0.5);
+                            if (!isfinite(p2) || p2 < 0)
+                            {
+                                particle_invalid = 1;
+                                break;
+                            }
+                            p_tmp = sqrt(p2);
                         }
+                        if (particle_invalid)
+                            break;
                         p_tmp *= (k % 2 ? -1.0 : 1.0) * signop;
                     }
                 }
+                invalid |= particle_invalid;
                 x[i] = x_tmp;
                 p[i] = p_tmp;
             }
+            seeds[omp_get_thread_num()] = seed;
         }
-
-#pragma omp for schedule(static)
-        for (int i = 0; i < N_PART; i++)
+        if (invalid)
         {
-            int h_idx = floor((2.0 * x[i] + 1) * BINS + 2.5);
-            int g_idx = floor((p[i] / 3.0e-23 + 1) * BINS + 0.5);
-            int hg_idx = (2 * BINS + 1) * h_idx + g_idx;
-            h[h_idx]++;
-            g[g_idx]++;
-            hg[hg_idx]++;
+            fprintf(stderr, "Error: non-finite trajectory, excessive crossings or negative momentum squared\n");
+            exit(EXIT_FAILURE);
         }
 
+        fill_hist(h, g, hg, x, p, N_PART, BINS);
         evolution += steps[j];
-        if (evolution < 10000000)
-        {
-            sprintf(filename, "X%07d.dat", evolution);
-        }
-        else
-        {
-            sprintf(filename, "X%1.3e.dat", (double)evolution);
-            char *e = memchr(filename, 'e', 32);
-            strcpy(e + 1, e + 3);
-        }
+        snprintf(filename, sizeof(filename), "X%07d.dat", evolution);
         if (dump == 0)
         {
             save_data(saveFilename, x, p, evolution, N_PART);
@@ -202,6 +253,7 @@ int main()
 
     printf("Completo evolution = %d\n", evolution);
 
+    free(seeds);
     free(x);
     free(p);
     free(DxE);

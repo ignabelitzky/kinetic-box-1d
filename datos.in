@@ -3,7 +3,7 @@
           (Número de bins - 1)/2 (BINS): 500
                     Delta t en seg (DT): 2.215491295991e-7
        Masa de las partículas en kg (M): 6.646473667973E-27
-Nº de hilos para la corrida (N_THREADS): 32
+Nº de hilos para la corrida (N_THREADS): 8
 Tandas (nº de pasos) para esta corrida (steps):
    1000000 
 #   +1M              +3M                    +6M                             +10M
